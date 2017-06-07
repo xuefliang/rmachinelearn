@@ -1,0 +1,254 @@
+---
+title: "MLR xgboost"
+author: "data"
+date: "May 27, 2017"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#MLR
+在R语言中使用mlr包解决机器学习问题只需要牢记三个步骤即可：
+Create a Task：导入数据集，创建任务，可以是分类、回归、聚类等等
+Make a Learner：构建模型，模型构建过程中涉及到参数设定、参数调节诸多技巧
+Fit the model：拟合模型
+Make predictions：预测
+
+在R中，变量可以归结为名义型、有序型、或连续型变量，类别（名义型）变量和有序类别（有序型）在R中称为因子（factor）。
+值得注意的是mlr包对数据的格式是有要求的，mlr任务函数不接受字符型（char）变量，所以在构建任务函数前，必须确保将所有的变量转换为因子型（factor），
+
+xgboost视每个特征均为数值型，同时还支持遗漏变量和稀疏性数据，至于对数据进行何种预处理，决定权在用户手上。不同于之前，本次数据预处理仅仅是将字符型变量转换成因子，然后feed给mlr，mlr就直接开始创建任务（Create task）、构建模型（Make a learner）了，简单而且粗暴。
+
+```{r}
+# 加载包
+library(caret)
+library(data.table)
+library(xgboost)
+library(mlr)
+# 加载数据集
+train <- fread("~/Dropbox/rmachinelearn/census/train.csv",na.string=c(""," ","?","NA",NA)) 
+test <- fread("~/Dropbox/rmachinelearn/census/test.csv",na.string=c(""," ","?","NA",NA))
+table(is.na(train))
+table(is.na(test))
+#convert data frame to data table
+setDT(train)
+setDT(test)
+# convert characters to factors
+char_cols <- colnames(train)[sapply(train,is.character)]
+for(i in char_cols) set(train,j=i,value = factor(train[[i]]))
+for(i in char_cols) set(test,j=i,value = factor(test[[i]]))
+
+# 将目标变量取值替换为0,1，ifelse(test,yes,no)
+train[, income_level := ifelse(income_level == "-50000",0,1)]
+test[, income_level := ifelse(income_level == "-50000",0,1)]
+train$income_level <- as.factor(train$income_level)
+test$income_level <- as.factor(test$income_level)
+```
+
+## 创建任务
+```{r}
+train_task <- makeClassifTask(data = train, target = "income_level")
+test_task <- makeClassifTask(data = test, target = "income_level")
+```
+
+# one-hot编码
+```{r}
+train_task <- createDummyFeatures(obj = train_task)
+test_task <- createDummyFeatures(obj = test_task)
+```
+
+#MLR xgboost
+```{r}
+set.seed(2002)
+xgb_learner <- makeLearner("classif.xgboost",predict.type = "response")
+xgb_learner$par.vals <- list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  nrounds = 150,
+  print_every_n = 50
+)
+```
+
+define hyperparameters for tuning
+
+```{r}
+xg_ps <- makeParamSet( 
+  makeIntegerParam("max_depth",lower=3,upper=10),
+  makeNumericParam("lambda",lower=0.05,upper=0.5),
+  makeNumericParam("eta", lower = 0.01, upper = 0.5),
+  makeNumericParam("subsample", lower = 0.50, upper = 1),
+  makeNumericParam("min_child_weight",lower=2,upper=10),
+  makeNumericParam("colsample_bytree",lower = 0.50,upper = 0.80))
+```
+
+
+```{r}
+#define search function
+rancontrol <- makeTuneControlRandom(maxit = 5L) #do 5 iterations
+
+#5 fold cross validation
+set_cv <- makeResampleDesc("CV",iters = 5L,stratify = TRUE)
+```
+
+```{r}
+#library(parallel)
+#library(parallelMap)
+#parallelStartSocket(cpus = detectCores())
+#tune parameters
+xgb_tune <- tuneParams(learner = xgb_learner, task = train_task, resampling = set_cv, 
+                       measures = list(acc,tpr,tnr,fpr,fp,fn), par.set = xg_ps, 
+                       control = rancontrol)
+xgb_tune$y
+xgb_tune$x
+```
+
+xgb_tune$x查看参数调节得出的最优结果，将最优参数设定在模型xgb_new中，然后进行训练
+
+```{r}
+#set optimal parameters
+xgb_new <- setHyperPars(learner = xgb_learner, par.vals = xgb_tune$x)
+
+#train model
+xgmodel <- train(xgb_new, train_task)
+```
+
+```{r}
+#test model
+predict.xg <- predict(xgmodel, test_task)
+
+#make prediction
+xg_prediction <- predict.xg$data$response
+
+#make confusion matrix
+xg_confused <- confusionMatrix(test$income_level,xg_prediction)
+
+precision <- xg_confused$byClass['Pos Pred Value']
+recall <- xg_confused$byClass['Sensitivity']
+
+f_measure <- 2*((precision*recall)/(precision+recall))
+f_measure
+```
+
+lets get ROC xgboost ROC
+```{r}
+xgb_prob <- setPredictType(learner = xgb_new,predict.type = "prob")
+
+#train model
+xgmodel_prob <- train(xgb_prob,train_task)
+```
+
+```{r}
+#predict
+predict.xgprob <- predict(xgmodel_prob,test_task)
+
+#predicted probabilities
+predict.xgprob$data[1:10,]
+```
+
+```{r}
+df <- generateThreshVsPerfData(predict.xgprob,measures = list(fpr,tpr,auc))
+plotROCCurves(df)
+```
+we should aim to reduce the threshold so that the false positive rate can be reduced.
+```{r}
+#set threshold as 0.4
+pred2 <- setThreshold(predict.xgprob,0.4)
+confusionMatrix(test$income_level,pred2$data$response)
+```
+With 0.4 threshold, our model returned better predictions than our previous xgboost model at 0.5 threshold
+```{r}
+pred3 <- setThreshold(predict.xgprob,0.30)
+confusionMatrix(test$income_level,pred3$data$response)
+```
+
+This model has outperformed all our models i.e. in other words, this is the best model because 77% of the minority classes have been predicted correctly.
+
+Lets see if we can improve by experimenting with parameters increased no of rounds 10 fold CV increased repetitions in random search
+```{r}
+set.seed(2002)
+xgb_learner1 <- makeLearner("classif.xgboost",predict.type = "response")
+xgb_learner1$par.vals <- list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  nrounds = 250,
+  print_every_n = 50
+)
+
+#define hyperparameters for tuning
+xg_ps1 <- makeParamSet( 
+  makeIntegerParam("max_depth",lower=3,upper=10),
+  makeNumericParam("lambda",lower=0.05,upper=0.5),
+  makeNumericParam("eta", lower = 0.01, upper = 0.5),
+  makeNumericParam("subsample", lower = 0.50, upper = 1),
+  makeNumericParam("min_child_weight",lower=2,upper=10),
+  makeNumericParam("colsample_bytree",lower = 0.50,upper = 0.80)
+)
+
+#define search function
+rancontrol1 <- makeTuneControlRandom(maxit = 10L) #do 10 iterations
+
+#10 fold cross validation
+set_cv1 <- makeResampleDesc("CV",iters = 10L,stratify = TRUE)
+
+#tune parameters
+xgb_tune1 <- tuneParams(learner = xgb_learner1, task = train_task, resampling = set_cv1, 
+                       measures = list(acc,tpr,tnr,fpr,fp,fn), par.set = xg_ps1, 
+                       control = rancontrol1)
+```
+
+```{r}
+#set optimal parameters
+xgb_new1 <- setHyperPars(learner = xgb_learner1, par.vals = xgb_tune1$x)
+
+#train model
+xgmodel1 <- train(xgb_new1, train_task)
+```
+
+```{r}
+#test model
+predict.xg1 <- predict(xgmodel1, test_task)
+
+#make prediction
+xg_prediction1 <- predict.xg1$data$response
+
+#make confusion matrix
+xg_confused1 <- confusionMatrix(test$income_level,xg_prediction1)
+
+precision1 <- xg_confused1$byClass['Pos Pred Value']
+recall1 <- xg_confused1$byClass['Sensitivity']
+
+f_measure1 <- 2*((precision1*recall1)/(precision1+recall1))
+f_measure1
+```
+
+slightly better performance - 0.9728658
+
+XG Boost outperformed naive bayes
+
+lets get ROC xgboost ROC
+```{r}
+xgb_prob1 <- setPredictType(learner = xgb_new1,predict.type = "prob")
+
+#train model
+xgmodel_prob1 <- train(xgb_prob1,train_task)
+```
+
+```{r}
+#predict
+predict.xgprob1 <- predict(xgmodel_prob1,test_task)
+
+#predicted probabilities
+predict.xgprob1$data[1:10,]
+```
+
+```{r}
+df1 <- generateThreshVsPerfData(predict.xgprob1,measures = list(fpr,tpr,auc))
+plotROCCurves(df1)
+```
+
+```{r}
+pred4 <- setThreshold(predict.xgprob1,0.30)
+confusionMatrix(test$income_level,pred4$data$response)
+```

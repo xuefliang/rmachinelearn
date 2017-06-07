@@ -1,0 +1,88 @@
+---
+title: "Xgboost"
+author: "data"
+date: "May 27, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#xgboost
+我们完成了对数据的预处理、可视化以及模型训练与预测等等工作，对数据有了整体的认识。在对实验数据进行预处理的时候，缺失值（missing values）和高相关性变量（variables with high correlation）是重点关注的对象。解决了这两个问题后，数据集样本不平衡的缺陷仍旧没有根除，所以针对数据分别进行了上采样、下采样以及SMOTE三种采样方法。显然，采样花费时间最久的SMOTE在模型中表现最佳，拿到了最高的准确率0.896，可是正当准备庆祝的时候，一个不幸的“消息”告诉我们：特异度（Specificity）只有0.254。也就是说，模型对预测收入高于5w的少数人群（minority class）表现不太好，这样的模型结果是不太令人满意的，能够拿到0.896的准确率自然也是在情理之中，毕竟正反样本的比例（96:4）摆在那里。为了克服这个缺陷，我们在R语言中采用了高效、性能强大的xgboost处理框架，最终得到理想的数据。
+
+先对数据进行预处理，预处理的思路是：分别考虑训练集、测试集中的数值型变量和类别型变量，对数值型，剔除高度相关的变量，对类别型，剔除数据遗漏严重的变量。经过上述两个步骤后，再将 数值型和类别型变量重新组合。因为R对内存的要求太苛刻了，完成数据预处理后，还需要将train,test,num_train,num_test,cat_train,cat_test从RStudio中移除以减少内存占用，不然会出现内存不够的情况。以笔者8G内存的台式机器为例，本次实验中CPU与内存满负荷运算是常事，还出现几次假死、崩溃的情况，所以在R中进行数据处理的时候一定要注意内存的管理。
+
+```{r}
+# 加载包
+library(caret)
+library(data.table)
+library(xgboost)
+library(mlr)
+# 加载数据集
+train <- fread("~/Dropbox/rmachinelearn/census/train.csv",na.string=c(""," ","?","NA",NA)) 
+test <- fread("~/Dropbox/rmachinelearn/census/test.csv",na.string=c(""," ","?","NA",NA))
+table(is.na(train))
+table(is.na(test))
+# 将目标变量取值替换为0,1，ifelse(test,yes,no)
+train[, income_level := ifelse(income_level == "-50000",0,1)]
+test[, income_level := ifelse(income_level == "-50000",0,1)]
+
+# 将train,test数据切分为数值型和类别型
+factcols <- c(2:5,7,8:16,20:29,31:38,40,41)
+numcols <- setdiff(1:40,factcols)
+cat_train <- train[,factcols, with=FALSE]
+cat_test <- test[,factcols,with=FALSE]
+num_train <- train[,numcols,with=FALSE]
+num_test <- test[,numcols,with=FALSE]
+# 去掉数值型(num)数据中高度相关的变量
+ax <- findCorrelation(cor(num_train), cutoff = 0.7)
+num_train <- num_train[,-ax,with=FALSE];num_test <- num_test[,-ax,with=FALSE]
+# 处理类别型(cat)数据中的遗漏值
+mvtr <- sapply(cat_train, function(x){sum(is.na(x))/length(x)}*100)
+mvte <- sapply(cat_test, function(x){sum(is.na(x)/length(x))}*100)
+# 将遗漏率小于5%的列单独挑选出来
+cat_train <- subset(cat_train, select = mvtr < 5 )
+cat_test <- subset(cat_test, select = mvte < 5)
+cat_train[is.na(cat_train)] <- "Missing";cat_test[is.na(cat_test)] <- "Missing" 
+# 合并数值型和分类型数据
+d_train <- cbind(num_train, cat_train);d_test <- cbind(num_test, cat_test)
+rm(train,test,num_train,num_test,cat_train,cat_test)
+```
+
+```{r}
+#using one hot encoding
+tr_labels <- d_train$income_level
+ts_labels <- d_test$income_level
+new_tr <- model.matrix(~.+0,data = d_train[,-c("income_level"),with=F])
+new_ts <- model.matrix(~.+0,data = d_test[,-c("income_level"),with=F])
+#convert factor to numeric
+#XGBoost  accept 0,1,0,1 for label
+tr_labels <- as.numeric(tr_labels)
+ts_labels <- as.numeric(ts_labels)
+# 准备矩阵
+dtrain <- xgb.DMatrix(data = new_tr,label = tr_labels) 
+dtest <- xgb.DMatrix(data = new_ts,label= ts_labels)
+
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.3, gamma=0, max_depth=6,
+               min_child_weight=1, subsample=1, colsample_bytree=1)
+
+xgbcv <- xgb.cv(params = params, data = dtrain, nrounds = 100, nfold = 5, showsd = T, 
+                stratified = T, print_every_n = 10,early_stopping_rounds = 20, maximize = F)
+
+xgb1 <- xgb.train (params = params, data = dtrain, nrounds = 100, 
+                   watchlist = list(val=dtest,train=dtrain), print_every_n = 10, 
+                   early_stopping_rounds= 10, maximize = F , eval_metric = "error")
+
+xgbpred <- predict (xgb1,dtest)
+xgbpred <- ifelse (xgbpred > 0.5,1,0)
+library(caret)
+confusionMatrix(xgbpred, ts_labels)
+mat <- xgb.importance (feature_names = colnames(new_tr),model = xgb1)
+xgb.plot.importance (importance_matrix = mat[1:20]) 
+```
+其实，即使是给模型设定默认的参数也能得到意想不到的准确率，xgboost在kaggle社区中如此受欢迎也是有理由的。运行，训练模型（耗时约4分钟）并预测，模糊矩阵confusionMatrix(xgbpred, ts_labels)结果显示模型准确率达到了95.51%，然而这并不是重点。提升模型对预测收入高于5w的少数人群（minority class）的预测能力才是我们的目标，结果显示特异度（Specificity）达到47.12%，比上一个朴素贝叶斯提升了11.7%，效果仍然不是特别完美，不过也还可以了！无论是准确率还是其他衡量指标，xgboost得出的结果是全面优于之前的朴素贝叶斯模型的，那么还有没有提升的空间呢？
+
+
+
